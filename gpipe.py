@@ -1,17 +1,25 @@
-from typing import Iterable, Union, Any
 import copy
-import matplotlib.pyplot as plt
-import numpy as np
+from timeit import timeit
+from typing import Iterable, Union, Any
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 
-from timeit import timeit
+
+def device(d: Union[int, str, torch.device]) -> Union[torch.device]:
+    if isinstance(d, torch.device):
+        return d
+    elif isinstance(d, str):
+        return torch.device(d)
+    elif isinstance(d, int):
+        return torch.device(f'cuda:{d}')
+
 
 class GPipe(nn.Module):
 
-    def __init__(self, *models: nn.Module, balance : Iterable[int], devices: Union[None, Iterable[Union[int, str, torch.device]]] = None, chunks: Union[None, int] = None) -> None:
+    def __init__(self, *models: nn.Module, balance: Iterable[int],
+                 devices: Union[None, Iterable[Union[int, str, torch.device]]] = None,
+                 chunks: Union[None, int] = None) -> None:
         super(GPipe, self).__init__()
         if not devices:
             devices = range(torch.cuda.device_count())
@@ -19,15 +27,6 @@ class GPipe(nn.Module):
             chunks = len(balance)
         assert chunks > 0
         assert sum(balance) == len(models)
-
-        def device(d: Union[int, str, torch.device]):
-            if isinstance(d, torch.device):
-                return d
-            elif isinstance(d, str):
-                return torch.device(d)
-            elif isinstance(d, int):
-                return torch.device(f'cuda:{d}')
-            return None
 
         self.balance = balance
         self.chunks = chunks
@@ -37,7 +36,7 @@ class GPipe(nn.Module):
         index = 0
         models = list(models)
         for i, bal in enumerate(balance):
-            model = models[index:index+bal]
+            model = models[index:index + bal]
             if bal > 1:
                 model = nn.Sequential(*model)
             else:
@@ -60,7 +59,7 @@ class GPipe(nn.Module):
                 if index == len(self.models) - 1:
                     ret.append(chunk)
                 else:
-                    new_chunks.append((index+1, chunk))
+                    new_chunks.append((index + 1, chunk))
             chunks = new_chunks
         return torch.cat(ret)
 
