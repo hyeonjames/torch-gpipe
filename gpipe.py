@@ -1,10 +1,19 @@
 import copy
 from timeit import timeit
-from typing import Iterable, Union, Any
+from typing import Iterable, Union, Any, Optional
 
+import asyncio
 import torch
 import torch.nn as nn
-
+import torchvision.datasets as datasets
+import torchvision.models as md
+import torchvision.transforms as transforms
+import torch.optim as optim
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
+from queue import Queue
+import threading
+from torch.utils import checkpoint
 
 def device(d: Union[int, str, torch.device]) -> Union[torch.device]:
     if isinstance(d, torch.device):
@@ -14,25 +23,60 @@ def device(d: Union[int, str, torch.device]) -> Union[torch.device]:
     elif isinstance(d, int):
         return torch.device(f'cuda:{d}')
 
+def detach_tensors(tensors):
+    if isinstance(tensors, tuple):
+        out = []
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                out.append(tensor)
+            new_tensor = tensor.detach()
+            new_tensor.requires_grad = tensor.requires_grad
+            out.append(new_tensor)
+        return tuple(out)
+    else:
+        raise RuntimeError("")
+
+class CheckPoint(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, module, *args):
+        with torch.no_grad():
+            result = module(*args)
+        ctx.module = module
+        ctx.save_for_backward(*args)
+        return result
+
+    @staticmethod
+    def backward(ctx, *args):
+        i_args = detach_tensors(ctx.saved_tensors)
+        with torch.enable_grad():
+            outputs = ctx.module(*i_args)
+        torch.autograd.backward(outputs, args)
+        return tuple([None] + [x.grad if isinstance(x, torch.Tensor) else x for x in i_args])
+
+
+def my_checkpoint(model, *args):
+    return CheckPoint.apply(model, *args)
+
 
 class GPipe(nn.Module):
 
-    def __init__(self, *models: nn.Module, balance: Iterable[int],
-                 devices: Union[None, Iterable[Union[int, str, torch.device]]] = None,
-                 chunks: Union[None, int] = None) -> None:
+    def __init__(self, *models: nn.Module, balance: Optional[Iterable[float]] = None,
+                 devices: Optional[Iterable[Union[int, str, torch.device]]] = None,
+                 chunks: Optional[int] = None) -> None:
         super(GPipe, self).__init__()
         if not devices:
             devices = range(torch.cuda.device_count())
         if chunks is None:
             chunks = len(balance)
         assert chunks > 0
+        devices = list(devices)
+        if balance is None:
+            balance = [1./len(devices)]*len(devices)
         assert sum(balance) == len(models)
-
-        self.balance = balance
         self.chunks = chunks
         self.devices = [device(d) for d in devices]
         self.models = nn.ModuleList()
-
         index = 0
         models = list(models)
         for i, bal in enumerate(balance):
@@ -41,38 +85,42 @@ class GPipe(nn.Module):
                 model = nn.Sequential(*model)
             else:
                 model = model[0]
-            self.models.append(model.to(self.devices[i]))
+            self.models.append(model.to(self.devices[i], non_blocking=True))
             index += bal
 
     def __len__(self):
         return sum([len(x) for x in self.models])
 
     def forward(self, x: torch.Tensor) -> Any:
-        chunks = [(-i, chunk) for i, chunk in enumerate(x.chunk(self.chunks))]
-        chunks = chunks[::-1]
+        chunks = x.chunk(self.chunks)
         ret = []
-        while len(chunks) > 0:
-            new_chunks = []
-            for index, chunk in chunks:
-                if index >= 0:
-                    chunk = self.models[index](chunk.to(self.devices[index]))
-                if index == len(self.models) - 1:
-                    ret.append(chunk)
-                else:
-                    new_chunks.append((index + 1, chunk))
-            chunks = new_chunks
+        for chunk in chunks:
+            for index, model in enumerate(self.models):
+                chunk = my_checkpoint(model, chunk.to(self.devices[index], non_blocking=True))
+            ret.append(chunk)
         return torch.cat(ret)
 
-
 if __name__ == '__main__':
-    data = torch.randn(1000000, 1000)
-    linear1 = nn.Linear(1000, 10)
-    linear2 = nn.Linear(10, 10)
-    linear3 = nn.Linear(10, 10)
-    seq = nn.Sequential(linear1, linear2, linear3).cuda(0)
-    model2 = GPipe(copy.deepcopy(linear1), copy.deepcopy(linear2), copy.deepcopy(linear3), balance=[1, 2], chunks=2)
-    r1 = seq(data.cuda(0))
-    r2 = model2(data).cuda(0)
-    assert torch.all(torch.eq(r1, r2)).item()
-    print(timeit(lambda: seq(data.cuda(0)), number=1))
-    print(timeit(lambda: model2(data), number=1))
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([.5,.5,.5], [.5,.5,.5])
+    ])
+    data = datasets.CIFAR10('/data/private/datasets', train=True, download=False, transform=transform)
+    resnet = md.resnet50(True)
+    trainloader = torch.utils.data.DataLoader(data, shuffle=True, batch_size=8192)
+    # 32*32*3*3*3 + 64*32*32*3*3*64
+    model = GPipe(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool, resnet.layer1,resnet.layer2,
+                  resnet.layer3,
+                  resnet.layer4,
+                  resnet.avgpool, nn.Flatten(), resnet.fc, balance=[6,1,1,3], devices=[0, 1, 2, 3], chunks=4)
+    optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(10):
+        for inputs, target in trainloader:
+            optimizer.zero_grad()
+            target = target.cuda(3)
+            outputs = model(inputs.requires_grad_())
+            loss = criterion(outputs, target)
+            loss.backward()
+            optimizer.step()
+        print(f'epoch {epoch}')
